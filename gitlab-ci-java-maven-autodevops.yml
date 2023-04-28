@@ -1,0 +1,502 @@
+image: alpine:latest
+
+variables:
+  DOCKER_DRIVER: overlay2
+  MAVEN_CLI_OPTS: " --batch-mode"
+  MAVEN_OPTS: "-Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository"
+  ROLLOUT_RESOURCE_TYPE: deployment
+  DOCKER_TLS_CERTDIR: ""  # https://gitlab.com/gitlab-org/gitlab-runner/issues/4501
+  DOCKER_INSECURE: "true"
+
+cache:
+    paths:
+      - .m2/repository
+
+stages:
+  - compile
+  - build
+  - test
+  - package
+  - publication
+  - review
+  - staging
+  - canary
+  - production
+  - incremental rollout 10%
+  - incremental rollout 25%
+  - incremental rollout 50%
+  - incremental rollout 100%
+  - performance
+  - cleanup
+
+compile:
+  stage: compile
+  image: maven:latest 
+  script:
+    - echo "Compiling the code..."
+    - mvn $MAVEN_CLI_OPTS clean 
+    - mvn $MAVEN_CLI_OPTS validate
+    - mvn $MAVEN_CLI_OPTS compile
+    
+  cache:
+    paths:
+      - .m2/repository
+  artifacts:
+    paths:
+      - target/*.jar
+    expire_in: 1 day
+
+
+
+build-docker:
+  stage: build
+  image: gitlab-org/cluster-integration/auto-build-image:v0.6.0
+  variables:
+    DOCKER_TLS_CERTDIR: ''
+  script:
+  - |
+    if [[ -z "$CI_COMMIT_TAG" ]]; then
+      export CI_APPLICATION_REPOSITORY=${CI_APPLICATION_REPOSITORY:-$CI_REGISTRY_IMAGE}
+      export CI_APPLICATION_TAG=${CI_APPLICATION_TAG:-$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA}
+    else
+      export CI_APPLICATION_REPOSITORY=${CI_APPLICATION_REPOSITORY:-$CI_REGISTRY_IMAGE}
+      export CI_APPLICATION_TAG=${CI_APPLICATION_TAG:-$CI_COMMIT_TAG}
+    fi
+  - "/build/build.sh" 
+  rules:
+  - if: "$CI_COMMIT_TAG || $CI_COMMIT_BRANCH"
+
+build-artifacts:
+  stage: build
+  image: maven:latest
+  script:
+    - mkdir -p artifacts
+    - mvn clean package -DskipTests=true
+    - mv target/*.jar artifacts/$PROJECT_NAME.jar || mv src/$MODULE_PREFIX-application/target/*.jar artifacts/$PROJECT_NAME.jar || mv src/web-adapter/target/*.jar artifacts/$PROJECT_NAME.jar
+    - mv target/*.war artifacts/$PROJECT_NAME.war || mv src/$MODULE_PREFIX-application/target/*.war artifacts/$PROJECT_NAME.war || mv src/web-adapter/target/*.war artifacts/$PROJECT_NAME.war
+  allow_failure: true
+  artifacts:
+    paths:
+      - artifacts/
+    expire_in: 1 week
+  rules:
+    - if: "$CI_COMMIT_TAG || $CI_COMMIT_BRANCH=~ /^develop.*$/ || $CI_COMMIT_BRANCH=~ /^kube-develop.*$/ || $CI_COMMIT_BRANCH=~ /^release.*$/ || $CI_COMMIT_BRANCH=~ /^hotfix.*$/"
+
+test:
+  stage: test
+  image: maven:latest
+  script:
+    - mvn test
+  needs: []
+  cache:
+    paths:
+      - .m2/repository
+
+
+code_quality:
+  stage: test
+  image: docker:19.03.12
+  allow_failure: true
+  services: 
+  variables:
+    DOCKER_DRIVER: overlay2
+    DOCKER_TLS_CERTDIR: ''
+    CODE_QUALITY_IMAGE: gitlab-org/ci-cd/codequality:0.85.26
+  script:
+  - cp $codeclimate_yml .codeclimate.yml 
+  - export SOURCE_CODE=$PWD
+  - |
+    if ! docker info &>/dev/null; then
+      if [ -z "$DOCKER_HOST" -a "$KUBERNETES_PORT" ]; then
+        export DOCKER_HOST='tcp://localhost:2375'
+      fi
+    fi
+  - |
+    function propagate_env_vars() {
+      CURRENT_ENV=$(printenv)
+
+      for VAR_NAME; do
+        echo $CURRENT_ENV | grep "${VAR_NAME}=" > /dev/null && echo "--env $VAR_NAME "
+      done
+    }
+  - docker login -u $DOCKER_LOGIN -p $DOCKER_PASSWORD
+  - docker pull --quiet "$CODE_QUALITY_IMAGE"
+  - |
+    docker run \
+      $(propagate_env_vars \
+        SOURCE_CODE \
+        TIMEOUT_SECONDS \
+        CODECLIMATE_DEBUG \
+        CODECLIMATE_DEV \
+        REPORT_STDOUT \
+        REPORT_FORMAT \
+        ENGINE_MEMORY_LIMIT_BYTES \
+        CODECLIMATE_PREFIX \
+      ) \
+      --volume "$PWD":/code \
+      --volume /var/run/docker.sock:/var/run/docker.sock \
+      "$CODE_QUALITY_IMAGE" /code
+  artifacts:
+    reports:
+      codequality:
+      - gl-code-quality-report.json
+    expire_in: 1 week
+    paths:
+    - gl-code-quality-report.json
+  dependencies: []
+  needs: []
+  tags:
+  - cq-sans-dind
+  rules:
+    - if: "$CI_COMMIT_BRANCH=~ /^develop.*$/"
+
+  
+code_quality_html:
+  stage: test
+  extends: code_quality
+  services:
+  tags:
+    - cq-sans-dind
+  variables:
+    REPORT_FORMAT: html
+  artifacts:
+    paths: [gl-code-quality-report.html]
+    expire_in: 1 week
+  rules:
+    - if: "$CI_COMMIT_BRANCH=~ /^develop.*$/"
+
+
+dependency_scanning:
+  stage: test
+  script:
+  - echo "$CI_JOB_NAME is used for configuration only, and its script should not be
+    executed"
+  - exit 1
+  artifacts:
+    reports:
+      dependency_scanning:
+      - gl-dependency-scanning-report.json
+  dependencies: []
+  rules:
+    - when: never
+".ds-analyzer":
+  stage: test
+  script:
+  - docker login -u $DOCKER_LOGIN -p $DOCKER_PASSWORD repo.gbp.cpm.net:3000
+  - "/analyzer run"
+  artifacts:
+    reports:
+      dependency_scanning: gl-dependency-scanning-report.json
+  dependencies: []
+  rules:
+    - when: never
+  extends: dependency_scanning
+  allow_failure: true
+".cyclone-dx-reports":
+  artifacts:
+    paths:
+    - "**/cyclonedx-*.json"
+
+
+gemnasium-dependency_scanning:
+  stage: test
+  script:
+  - git config --global http.sslVerify false  
+  - "/analyzer run"
+  artifacts:
+    reports:
+      dependency_scanning:
+      - gl-dependency-scanning-report.json
+    paths:
+#    - "**/cyclonedx-*.json"      
+    - gl-dependency-scanning-report.json
+  dependencies: []
+  rules:
+    - if: "$CI_COMMIT_BRANCH=~ /^develop.*$/"
+      when : always
+  extends: 
+    - ".ds-analyzer"
+    - ".cyclone-dx-reports"
+  allow_failure: true
+  image:
+    name: "$DS_ANALYZER_IMAGE"
+  variables:
+    
+    DS_ANALYZER_IMAGE: "gitlab-org/security-products/analyzers/gemnasium:3-fips"
+
+
+.sast-analyzer:
+  stage: test
+  artifacts:
+    reports:
+      sast: gl-sast-report.json
+  variables:
+    SEARCH_MAX_DEPTH: 4
+  script:
+  - "/analyzer run || true"
+  allow_failure: true
+spotbugs-sast:
+  stage: test
+  artifacts:
+    reports:
+      sast:
+      - gl-sast-report.json
+    paths:
+    - gl-sast-report.json
+  variables:
+    SEARCH_MAX_DEPTH: 4
+#    SAST_ANALYZER_IMAGE: "repo.gbp.cpm.net:3000/gitlab-org/security-products/analyzers/spotbugs:2.28.3"
+    SAST_ANALYZER_IMAGE: "security-products/spotbugs:3"
+    COMPILE: "false"
+  script:
+  - "/analyzer run"
+  extends: ".sast-analyzer"
+  allow_failure: true
+  image:
+    name: "$SAST_ANALYZER_IMAGE"
+  rules:
+    - if: "$CI_COMMIT_BRANCH=~ /^develop.*$/"
+
+license_scanning:
+  stage: test
+  image:
+    name: "security-products/license-finder:4"
+    entrypoint: [""]
+  variables:
+    LM_REPORT_VERSION: '2.1'
+    SETUP_CMD: $LICENSE_MANAGEMENT_SETUP_CMD
+  allow_failure: true
+  script:
+    - /run.sh analyze .
+  artifacts:
+    reports:
+      license_scanning: gl-license-scanning-report.json
+    expire_in: 1 week
+    paths:
+    - gl-license-scanning-report.json
+  dependencies: []
+  needs: []
+  rules:
+    - if: $LICENSE_MANAGEMENT_DISABLED
+      when: never  
+    - if: "$CI_COMMIT_BRANCH=~ /^develop.*$/"
+
+
+
+".cs_common":
+  stage: test
+  image: "$CS_ANALYZER_IMAGE"
+  variables:
+    GIT_STRATEGY: none
+    CS_ANALYZER_IMAGE: "gitlab-org/security-products/analyzers/$CS_PROJECT:3"
+  allow_failure: true
+  artifacts:
+    reports:
+      container_scanning: gl-container-scanning-report.json
+  dependencies: []
+container_scanning:
+  stage: test
+  image: "$CS_ANALYZER_IMAGE"
+  variables:
+    GIT_STRATEGY: none
+    #CS_ANALYZER_IMAGE: "repo.gbp.cpm.net:3000/gitlab-org/security-products/analyzers/$CS_PROJECT:3"
+    CS_ANALYZER_IMAGE: "security-products/container-scanning:5-fips"
+    CS_DOCKER_INSECURE: "true"
+    CS_REGISTRY_INSECURE: "true"
+    CI_GITLAB_FIPS_MODE: "false"
+    CS_REGISTRY_PASSWORD: "$CI_JOB_TOKEN"   
+    #CLAIR_DB_IMAGE_TAG: latest
+    #CLAIR_DB_IMAGE: "repo.gbp.cpm.net:3000/gitlab-org/security-products/analyzers/clair-vulnerabilities-db:$CLAIR_DB_IMAGE_TAG"
+    #CS_PROJECT: klar
+  allow_failure: true
+  artifacts:
+    reports:
+      container_scanning: gl-container-scanning-report.json
+      dependency_scanning: gl-dependency-scanning-report.json
+    paths:
+      - gl-container-scanning-report.json
+      - gl-dependency-scanning-report.json
+
+  dependencies: []
+  #extends: ".cs_common"
+  #services:
+  #  - name: "$CLAIR_DB_IMAGE"
+  #    alias: clair-vulnerabilities-db
+  script:
+    - |
+      if [[ -z "$CI_COMMIT_TAG" ]]; then
+        export CI_APPLICATION_REPOSITORY=${CI_APPLICATION_REPOSITORY:-$CI_REGISTRY_IMAGE}
+        export CI_APPLICATION_TAG=${CI_APPLICATION_TAG:-$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA}
+      else
+        export CI_APPLICATION_REPOSITORY=${CI_APPLICATION_REPOSITORY:-$CI_REGISTRY_IMAGE}
+        export CI_APPLICATION_TAG=${CI_APPLICATION_TAG:-$CI_COMMIT_TAG}
+      fi
+    #- "/analyzer run"
+    - gtcs scan
+  rules:
+    - if: "$CI_COMMIT_BRANCH=~ /^develop.*$/"
+
+".secret-analyzer":
+  stage: test
+  image: "security-products/secrets:4"
+  services: []
+  needs: []
+  allow_failure: true
+  artifacts:
+    reports:
+      secret_detection: gl-secret-detection-report.json
+secret_detection_default_branch:
+  stage: test
+#  image: "repo.gbp.cpm.net:3000/gitlab-org/security-products/analyzers/secrets:3"
+  image: "gitlab-org/security-products/analyzers/secrets:4"  
+  services: []
+  allow_failure: true
+  artifacts:
+    reports:
+      secret_detection:
+      - gl-secret-detection-report.json
+    paths:
+    - gl-secret-detection-report.json
+  extends: ".secret-analyzer"
+  rules:
+  - if: "$SECRET_DETECTION_DISABLED"
+    when: never
+  - if: "$CI_DEFAULT_BRANCH == $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH=~ /^develop.*$/"
+  script:
+  - "/analyzer run"
+
+
+.auto-deploy:
+  image: gitlab-org/cluster-integration/auto-deploy-image:v2.8.0
+#  dependencies: []
+staging:
+  stage: staging
+  extends: .auto-deploy
+  variables:
+    K8S_SECRET_SPRING_CLOUD_ENABLED : $STA_SPRING_CLOUD_ENABLED
+    K8S_SECRET_SPRING_CLOUD_LABEL : $STA_SPRING_CLOUD_LABEL
+    K8S_SECRET_SPRING_CLOUD_PASSWORD : $STA_SPRING_CLOUD_PASSWORD
+    K8S_SECRET_SPRING_CLOUD_URI : $STA_SPRING_CLOUD_URI
+    K8S_SECRET_SPRING_CLOUD_USER : $STA_SPRING_CLOUD_USER
+    K8S_SECRET_SPRING_PROFILES_ACTIVE : $STA_SPRING_PROFILES_ACTIVE
+  script:
+  - |
+    if [[ -z "$CI_COMMIT_TAG" ]]; then
+      export CI_APPLICATION_REPOSITORY=${CI_APPLICATION_REPOSITORY:-$CI_REGISTRY_IMAGE}
+      export CI_APPLICATION_TAG=${CI_APPLICATION_TAG:-$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA}
+    else
+      export CI_APPLICATION_REPOSITORY=${CI_APPLICATION_REPOSITORY:-$CI_REGISTRY_IMAGE}
+      export CI_APPLICATION_TAG=${CI_APPLICATION_TAG:-$CI_COMMIT_TAG}
+    fi
+  - auto-deploy check_kube_domain
+  - | 
+    if [[ -d chart ]]; then
+      echo "Download skipped. Using the chart at local path 'chart/'..."
+    elif [[ -n "$AUTO_DEVOPS_CHART" ]]; then
+      # user specified a custom chart to use, but it can be a local directory or a remote chart
+      if [[ -d "$AUTO_DEVOPS_CHART" ]]; then
+        echo "Download skipped. Using the chart at local path '$AUTO_DEVOPS_CHART' (moving to 'chart/' first)..."
+        mv "$AUTO_DEVOPS_CHART" chart/
+      else
+        echo "Downloading remote chart '$AUTO_DEVOPS_CHART'..."
+        helm pull "$AUTO_DEVOPS_CHART" --untar
+
+        local auto_chart_name
+        auto_chart_name=$(basename "$AUTO_DEVOPS_CHART")
+        auto_chart_name=${auto_chart_name%.tgz}
+        auto_chart_name=${auto_chart_name%.tar.gz}
+        if [[ "$auto_chart_name" != "chart" ]]; then
+          mv "$auto_chart_name" chart
+        fi
+      fi
+    else
+      echo "Download skipped. Using the default chart included in auto-deploy-image..."
+      cp -R "$ASSETS_CHART_DIR" chart
+    fi
+
+    if [[ -f chart/requirements.lock ]]; then
+      helm dependency build chart/
+    else
+      helm dependency update chart/
+    fi
+  - auto-deploy ensure_namespace
+  - auto-deploy initialize_tiller
+#  - auto-deploy create_secret
+  - |
+    echo "Create secret..."
+    if [[ "$CI_PROJECT_VISIBILITY" == "public" ]]; then
+      return
+    fi
+    kubectl create secret -n "$KUBE_NAMESPACE" docker-registry "gitlab-registry-${CI_PROJECT_PATH_SLUG}" --docker-server="$CI_REGISTRY" --docker-username="$CI_DEPLOY_USER" --docker-password="$CI_DEPLOY_PASSWORD" -o yaml --dry-run | kubectl replace -n "$KUBE_NAMESPACE" --force -f -
+  - echo $CI_APPLICATION_REPOSITORY 
+  - echo $CI_APPLICATION_TAG 
+  - auto-deploy deploy
+  - auto-deploy persist_environment_url
+  environment:
+    name: staging
+    url: https://$CI_PROJECT_NAMESPACE-$CI_PROJECT_NAME.$KUBE_INGRESS_BASE_DOMAIN
+    kubernetes:
+      namespace: "$CI_PROJECT_NAMESPACE"
+  artifacts:
+    paths:
+    - environment_url.txt
+    - tiller.log
+    when: always
+  rules:
+  - if: '$CI_KUBERNETES_ACTIVE == null || $CI_KUBERNETES_ACTIVE == ""'
+    when: never
+  - if: "$REVIEW_DISABLED"
+    when: never
+  - if: "$CI_COMMIT_TAG || $CI_COMMIT_BRANCH=~ /^develop.*$/ || $CI_COMMIT_BRANCH=~ /^kube-develop.*$/ || $CI_COMMIT_BRANCH=~ /^release.*$/ || $CI_COMMIT_BRANCH=~ /^hotfix.*$/"
+
+preprod:
+  extends: .auto-deploy
+  stage: staging
+  variables:
+    K8S_SECRET_SPRING_CLOUD_ENABLED : $PREP_SPRING_CLOUD_ENABLED
+    K8S_SECRET_SPRING_CLOUD_LABEL : $PREP_SPRING_CLOUD_LABEL
+    K8S_SECRET_SPRING_CLOUD_PASSWORD : $PREP_SPRING_CLOUD_PASSWORD
+    K8S_SECRET_SPRING_CLOUD_URI	 : $PREP_SPRING_CLOUD_URI
+    K8S_SECRET_SPRING_CLOUD_USER : $PREP_SPRING_CLOUD_USER
+    K8S_SECRET_SPRING_PROFILES_ACTIVE : $PREP_SPRING_PROFILES_ACTIVE
+  before_script:
+  - echo $GITLAB_USER_LOGIN
+  - if [[ $OPS_INT =~ .*$GITLAB_USER_LOGIN.* ]]; then echo "OK"; else echo "vous n'êtes pas autorisé à déployer en Préproduction"; exit 1; fi   
+  script:
+  - |
+    if [[ -z "$CI_COMMIT_TAG" ]]; then
+      export CI_APPLICATION_REPOSITORY=${CI_APPLICATION_REPOSITORY:-$CI_REGISTRY_IMAGE}
+      export CI_APPLICATION_TAG=${CI_APPLICATION_TAG:-$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA}
+    else
+      export CI_APPLICATION_REPOSITORY=${CI_APPLICATION_REPOSITORY:-$CI_REGISTRY_IMAGE}
+      export CI_APPLICATION_TAG=${CI_APPLICATION_TAG:-$CI_COMMIT_TAG}
+    fi
+  - auto-deploy check_kube_domain
+  - |
+    cp -R /assets/auto-deploy-app chart
+    if [[ -f chart/requirements.lock ]]; then
+        helm dependency build chart/
+    else
+        helm dependency update chart/
+    fi
+  - auto-deploy ensure_namespace
+  - auto-deploy initialize_tiller
+#  - auto-deploy create_secret
+  - |
+    echo "Create secret..."
+    if [[ "$CI_PROJECT_VISIBILITY" == "public" ]]; then
+      return
+    fi
+    kubectl create secret -n "$KUBE_NAMESPACE" docker-registry "gitlab-registry-${CI_PROJECT_PATH_SLUG}" --docker-server="$CI_REGISTRY" --docker-username="$CI_DEPLOY_USER" --docker-password="$CI_DEPLOY_PASSWORD" -o yaml --dry-run | kubectl replace -n "$KUBE_NAMESPACE" --force -f -
+  - auto-deploy deploy
+  - auto-deploy persist_environment_url
+  environment:
+    name: preprod
+    url: https://$CI_PROJECT_NAMESPACE-$CI_PROJECT_NAME.$KUBE_INGRESS_BASE_DOMAIN
+    kubernetes:
+      namespace: "$CI_PROJECT_NAMESPACE"
+  rules:
+  - if: '$CI_KUBERNETES_ACTIVE == null || $CI_KUBERNETES_ACTIVE == ""'
+    when: manual  
+  - if: "$STAGING_ENABLED && ( $CI_COMMIT_BRANCH =~ /^release.*$/ || $CI_COMMIT_BRANCH =~ /^hotfix.*$/ )"
+    when: manual
